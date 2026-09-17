@@ -12,7 +12,7 @@
 
 Classlist is the app a lot of schools use for parent-to-parent messaging, class lists and events. It works fine, but everything lives inside the app, which means scrolling to find the thing you half remember reading. This tool puts the same information in a terminal window, where you can search it, read a whole class group at once, or check what is coming up without opening anything.
 
-Almost everything it does is reading. The one command that writes is `classlist post`, which asks you to confirm before anything is sent, and nothing else in the tool replies, RSVPs or changes your account.
+It reads, and it can write: post to a group, comment on a post, reply to an event invitation, and send a private message. Every one of those shows you what is about to be sent and waits for you to confirm.
 
 This is an unofficial tool, not made by or connected to Classlist.
 
@@ -104,7 +104,31 @@ Your conversations, then one conversation in full. Thread ids come from `classli
 classlist post "Anyone know when the book fair starts?" --group 5551234567890123
 ```
 
-Writes a post to one of your groups. It shows you the message and which group it is going to, and waits for you to type `y` before sending. Group ids come from `classlist groups`.
+Writes a post to one of your groups. Group ids come from `classlist groups`.
+
+```
+classlist comment 5551234567890123 "Starts at nine, I asked yesterday"
+classlist comment 5551234567890123 "Agreed" --reply-to 5559876543210987
+```
+
+Comments on a post, or replies to a comment on it. Post ids come from `classlist posts`.
+
+```
+classlist rsvp 5551234567890123 going
+classlist rsvp 5551234567890123 maybe
+classlist rsvp 5551234567890123 no
+```
+
+Answers an event invitation. Event ids come from `classlist events`.
+
+```
+classlist message "Is the lift still on for Friday?" --to "Jane Smith"
+classlist reply 5559876543210987 "Yes, see you at nine"
+```
+
+Sends a private message, or replies in a conversation you already have. For a new message, name the person the way the directory spells it, and repeat `--to` for several people. Thread ids come from `classlist messages`.
+
+Each of these prints the message and who is getting it, then waits for you to type `y`. Add `--yes` to skip that, which is what you would do in a script.
 
 ```
 classlist notifications
@@ -140,19 +164,11 @@ If a command fails with a number like 401 or 403, your session has expired in a 
 
 ## What it cannot do
 
-It cannot comment on someone else's post, RSVP to an event, or send a private message. Posting to a group is the only thing it writes.
+It cannot attach a photo or a file to anything it sends, create an event, or buy an event ticket.
 
 Two things Classlist's own servers refuse for a parent account, so they are not offered: the full text of a school announcement, and searching the directory on the server. The announcement list still shows the subject, who sent it and when, and `classlist contacts` searches the copy on your own computer instead.
 
 The verification-code step is built from the app's own sign-in flow, but the account it was developed against was never asked for a code, so that path has not been tested against a live prompt.
-
-## For the technically inclined
-
-Single Python file, no dependencies, about 400 lines. It calls the same endpoints as the Classlist web app at `https://api.classlist.com/_ah/api/`, sending the `ClasslistToken` header the app sends. There is no public or documented API; this was worked out by reading the app's own JavaScript.
-
-`classlist raw <path>` calls any endpoint directly and prints the JSON, which is how you get at anything not wrapped in a command. Unlike the rest of the tool, `raw` can send a `--body` and so can write.
-
-If you keep your credentials in 1Password, set `CLASSLIST_OP_ITEM` to the item reference, for example `op://Private/Classlist`, and sign-in reads the username and password from there instead of asking.
 
 ## Licence
 

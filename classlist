@@ -416,16 +416,98 @@ def cmd_post(args):
                "body": html.escape(text).replace("\n", "<br>"),
                "postCategory": "GENERAL", "groupId": args.group,
                "attachments": [], "files": [], "linkPreview": ""}
-    if not args.yes:
-        print(f"Posting to {groups[args.group]} as {session()['name']}:\n\n{text}\n")
-        if input("Send it? [y/N] ").strip().lower() not in ("y", "yes"):
-            sys.exit("Not sent.")
+    confirm(f"Posting to {groups[args.group]} as {session()['name']}", text, args.yes)
     d = api("post/v1/create/v4", body={"payload": payload})
     post = (d.get("payload") or {}).get("post") or {}
     if post.get("id"):
         print(f"Posted to {groups[args.group]}: {link('post', post['id'])}")
     else:
         print(json.dumps(d, indent=2)[:500])
+
+
+def confirm(what, detail, skip):
+    """Every outbound write shows what is about to be sent and waits."""
+    if skip:
+        return
+    print(f"{what}:\n\n{detail}\n")
+    if input("Send it? [y/N] ").strip().lower() not in ("y", "yes"):
+        sys.exit("Not sent.")
+
+
+def cmd_comment(args):
+    text = (sys.stdin.read() if args.text == "-" else args.text).strip()
+    if not text:
+        sys.exit("Nothing to say.")
+    if args.reply_to:
+        path = f"post/v1/commentReply/{args.reply_to}/create"
+        target = f"a reply to comment {args.reply_to}"
+    else:
+        path = f"post/v1/comment/{args.id}/create"
+        target = f"a comment on post {args.id}"
+    confirm(f"Posting {target} as {session()['name']}", text, args.yes)
+    api(path, body={"payload": {"repliedCommentId": args.reply_to,
+                               "commentText": html.escape(text),
+                               "fileId": ""}})
+    print(f"Commented: {link('post', args.id)}")
+
+
+RSVP = {"going": "GOING", "maybe": "MAYBE", "no": "NOT_GOING"}
+
+
+def cmd_rsvp(args):
+    answer = RSVP[args.answer]
+    event = api(f"event/v1/get/private/{args.id}/v2")
+    event = event.get("payload") or event
+    current = event.get("userAnswer") or {}
+    confirm(f"Replying {answer} to \"{safe(event.get('title'))}\"",
+            f"you are currently down as {current.get('userAnswer') or 'no reply'}",
+            args.yes)
+    api(f"event/v1/update/{args.id}/answer",
+        body={"eventAnswerId": current.get("userAnswerId"), "answer": answer})
+    print(f"Replied {answer} to {safe(event.get('title'))}: {link('event', args.id)}")
+
+
+def find_parent(needle):
+    """Accept a parent id, or a name to look up in the directory."""
+    if needle.isdigit():
+        return needle, needle
+    hits = [r for r in directory().get("parents", [])
+            if needle.lower() in r["name"].lower() and not r["me"]]
+    if not hits:
+        sys.exit(f"No parent matching {needle!r}. Try 'classlist contacts {needle}'.")
+    if len(hits) > 1:
+        names = ", ".join(h["name"] for h in hits[:6])
+        sys.exit(f"{needle!r} matches {len(hits)} parents: {names}. Be more specific.")
+    return hits[0]["id"], hits[0]["name"]
+
+
+def cmd_message(args):
+    text = (sys.stdin.read() if args.text == "-" else args.text).strip()
+    if not text:
+        sys.exit("Nothing to send.")
+    people = [find_parent(x) for x in args.to]
+    confirm("Sending a private message to " + ", ".join(n for _, n in people)
+            + f" as {session()['name']}", text, args.yes)
+    started = api(f"parent/v1/conversation/start/{sid()}",
+                  body={"participants": [i for i, _ in people]})
+    thread = started.get("id")
+    if not thread:
+        sys.exit(f"Classlist did not open a conversation: {json.dumps(started)[:200]}")
+    api(f"parent/v1/conversation/{thread}/reply",
+        body={"body": html.escape(text), "conversationId": thread})
+    print(f"Sent. Thread {thread}: see 'classlist thread {thread}'")
+
+
+def cmd_reply(args):
+    text = (sys.stdin.read() if args.text == "-" else args.text).strip()
+    if not text:
+        sys.exit("Nothing to send.")
+    thread = api(f"parent/v1/conversationV2/{args.id}/messages/list")
+    confirm(f"Replying in \"{safe(thread.get('subject')) or args.id}\" "
+            f"as {session()['name']}", text, args.yes)
+    api(f"parent/v1/conversation/{args.id}/reply",
+        body={"body": html.escape(text), "conversationId": args.id})
+    print(f"Replied in thread {args.id}")
 
 
 def cmd_events(args):
@@ -558,6 +640,32 @@ def main():
     s.add_argument("--group", required=True, help="group id, from 'classlist groups'")
     s.add_argument("--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_post)
+
+    s = sub.add_parser("comment", help="comment on a post", parents=[common])
+    s.add_argument("id", help="post id, from 'classlist posts'")
+    s.add_argument("text", help="the comment, or - to read it from stdin")
+    s.add_argument("--reply-to", help="comment id, to reply to a comment instead")
+    s.add_argument("--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_comment)
+
+    s = sub.add_parser("rsvp", help="reply to an event", parents=[common])
+    s.add_argument("id", help="event id, from 'classlist events'")
+    s.add_argument("answer", choices=sorted(RSVP))
+    s.add_argument("--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_rsvp)
+
+    s = sub.add_parser("message", help="send a private message", parents=[common])
+    s.add_argument("text", help="the message, or - to read it from stdin")
+    s.add_argument("--to", required=True, action="append",
+                   help="a parent's name or id; repeat for several people")
+    s.add_argument("--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_message)
+
+    s = sub.add_parser("reply", help="reply in a conversation", parents=[common])
+    s.add_argument("id", help="thread id, from 'classlist messages'")
+    s.add_argument("text", help="the reply, or - to read it from stdin")
+    s.add_argument("--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_reply)
 
     s = sub.add_parser("events", help="school events", parents=[common])
     s.add_argument("--past", action="store_true")
