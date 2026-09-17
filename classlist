@@ -234,10 +234,15 @@ def ts(value):
         except ValueError:
             return safe(value)
         return dt.astimezone().strftime("%Y-%m-%d %H:%M")
-    v = float(value)
-    if v > 1e11:
-        v /= 1000
-    return datetime.fromtimestamp(v, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    try:
+        v = float(value)
+        if v > 1e11:
+            v /= 1000
+        return datetime.fromtimestamp(v, timezone.utc).astimezone() \
+            .strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OverflowError, OSError):
+        # a timestamp the server invented should not stop a listing
+        return safe(value)[:32]
 
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
