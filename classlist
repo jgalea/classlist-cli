@@ -17,22 +17,33 @@ import sys
 import textwrap
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 API = "https://api.classlist.com/_ah/api/"
+APP = "https://app.classlist.com/parent/#"
 CONFIG = os.path.expanduser(os.environ.get("CLASSLIST_HOME", "~/.config/classlist"))
 SESSION = os.path.join(CONFIG, "session.json")
+DIRECTORY = os.path.join(CONFIG, "directory.json")
 DEVICE_FILE = os.path.join(CONFIG, "device")
 OP_ITEM = os.environ.get("CLASSLIST_OP_ITEM")  # e.g. op://Private/Classlist
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+DIRECTORY_TTL = 900
 
 
 class ApiError(Exception):
     def __init__(self, status, body):
         super().__init__(f"HTTP {status}: {body[:200]}")
         self.status = status
+
+
+def read_json(path):
+    """None rather than a traceback: a half-written cache file is recoverable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def write_private(path, text):
@@ -56,7 +67,7 @@ def device_id():
 
 def op_read(field):
     r = subprocess.run(["op", "read", f"{OP_ITEM}/{field}"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, check=False)
     if r.returncode:
         sys.exit(f"1Password read failed for {field}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -73,20 +84,24 @@ def credentials():
     return input("Email: ").strip(), getpass.getpass("Password: ")
 
 
-def request(path, token=None, ctx=None, body=None, method=None):
+def request(path, sess=None, body=None, method=None):
     headers = {"Content-Type": "application/json",
                "Origin": "https://app.classlist.com",
                "User-Agent": UA}
-    if token:
-        headers.update({"ClasslistToken": token, "p": "web-parent",
+    if sess:
+        headers.update({"ClasslistToken": sess["token"], "p": "web-parent",
                         "v": "no_version", "n": "false"})
-    if ctx:
-        headers.update({"u": ctx["user_id"], "s": ctx["school_id"]})
+        if sess.get("user_id"):
+            headers["u"] = sess["user_id"]
+        if sess.get("school_id"):
+            headers["s"] = sess["school_id"]
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(API + path, data=data, headers=headers,
-                                 method=method or ("POST" if data else "GET"))
+    verb = method or ("POST" if data else "GET")
+    req = urllib.request.Request(API + path, data=data, headers=headers, method=verb)
+    # Only replay reads. A timeout on a create may mean the server took it.
+    attempts = 3 if verb == "GET" else 1
     last = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
                 raw = r.read().decode()
@@ -95,11 +110,16 @@ def request(path, token=None, ctx=None, body=None, method=None):
             raise ApiError(e.code, e.read().decode())
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last = e
-            time.sleep(2 * (attempt + 1))
+            if attempt + 1 < attempts:
+                time.sleep(2 * (attempt + 1))
     raise SystemExit(f"Network error talking to Classlist: {last}")
 
 
+_SESSION = None
+
+
 def sign_in():
+    global _SESSION
     email, password = credentials()
     device = device_id()
     d = request("sso/v1/signIn", body={"email": email, "password": password,
@@ -109,22 +129,27 @@ def sign_in():
     token = d.get("classlistToken")
     if not token:
         sys.exit(f"Sign-in did not return a session (nextAction={d.get('nextAction')}).")
-    ctx = request("parent/v1/get/context/v2/0", token=token)
-    session = {"token": token,
-               "user_id": ctx["id"],
-               "school_id": ctx["school"]["id"],
-               "school_name": ctx["school"]["name"],
-               "name": f"{ctx['firstName']} {ctx['lastName']}",
-               "email": ctx["email"],
-               "saved_at": int(time.time())}
-    write_private(SESSION, json.dumps(session))
-    return session
+    ctx = request("parent/v1/get/context/v2/0", {"token": token})
+    _SESSION = {"token": token,
+                "user_id": ctx["id"],
+                "school_id": ctx["school"]["id"],
+                "school_name": safe(ctx["school"]["name"]),
+                "name": name_of(ctx),
+                "email": ctx["email"],
+                "saved_at": int(time.time())}
+    write_private(SESSION, json.dumps(_SESSION))
+    if os.path.exists(DIRECTORY):
+        os.remove(DIRECTORY)  # it belongs to whoever was signed in before
+    return _SESSION
 
 
 def two_factor(request_id, device):
     """Classlist emails a code when it does not recognise the computer."""
     if not request_id:
         sys.exit("Classlist asked for a verification code but sent no request id.")
+    if not sys.stdin.isatty():
+        sys.exit("Classlist emailed a verification code, but there is no terminal "
+                 "to type it into. Run 'classlist login' by hand once.")
     print("Classlist emailed you a verification code.")
     for attempt in range(3):
         code = input("Code: ").strip()
@@ -138,22 +163,30 @@ def two_factor(request_id, device):
 
 
 def session(force=False):
-    if not force and os.path.exists(SESSION):
-        with open(SESSION) as f:
-            return json.load(f)
-    return sign_in()
+    """The cached session, read from disk at most once per run."""
+    global _SESSION
+    if force:
+        return sign_in()
+    if _SESSION is None:
+        cached = read_json(SESSION)
+        if not cached or not cached.get("token") or not cached.get("school_id"):
+            return sign_in()
+        _SESSION = cached
+    return _SESSION
 
 
 def api(path, body=None, method=None):
     """Call the API, re-authenticating once if the cached token has expired."""
-    s = session()
     try:
-        return request(path, s["token"], s, body, method)
+        return request(path, session(), body, method)
     except ApiError as e:
         if e.status not in (401, 403):
             raise
-        s = sign_in()
-        return request(path, s["token"], s, body, method)
+        return request(path, sign_in(), body, method)
+
+
+def sid():
+    return session()["school_id"]
 
 
 def ts(value):
@@ -164,7 +197,7 @@ def ts(value):
         try:
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            return value
+            return safe(value)
         return dt.astimezone().strftime("%Y-%m-%d %H:%M")
     v = float(value)
     if v > 1e11:
@@ -172,13 +205,34 @@ def ts(value):
     return datetime.fromtimestamp(v, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def safe(value):
+    """Anything the server sends can reach a terminal, so drop control bytes.
+
+    Other parents choose their own display names and write their own posts,
+    and Classlist has no reason to strip an escape sequence it only ever
+    renders as HTML. Left in, one could repaint the screen or forge a link.
+    """
+    return _CONTROL.sub("", str(value)) if value else ""
+
+
+def name_of(obj, first="firstName", last="lastName"):
+    return safe(f"{obj.get(first, '')} {obj.get(last, '')}".strip())
+
+
 def clean(text, width=100):
     """Classlist bodies are HTML fragments; flatten them for the terminal."""
     if not text:
         return ""
     flat = re.sub(r"<br\s*/?>|</p>", " ", str(text))
-    flat = html.unescape(re.sub(r"<[^>]+>", "", flat))
+    flat = safe(html.unescape(re.sub(r"<[^>]+>", "", flat)))
     return textwrap.shorten(" ".join(flat.split()), width=width, placeholder="...")
+
+
+def link(kind, ident):
+    return f"{APP}/{kind}/{ident}"
 
 
 def out(args, data, render):
@@ -189,22 +243,37 @@ def out(args, data, render):
         render(data)
 
 
-def sid():
-    return session()["school_id"]
-
-
-DIRECTORY_TTL = 900  # the 906-parent directory changes rarely; refresh every 15 min
+def groups_list():
+    return api(f"group/v1/parent/{sid()}/list/v3")
 
 
 def directory(fresh=False):
-    """The parent directory, cached because it is a large single response."""
-    path = os.path.join(CONFIG, "directory.json")
-    if not fresh and os.path.exists(path):
-        if time.time() - os.path.getmtime(path) < DIRECTORY_TTL:
-            with open(path) as f:
-                return json.load(f)
-    data = api(f"parent/v1/{sid()}/listV2/classlist")
-    write_private(path, json.dumps(data))
+    """The parent directory, reduced to the fields this tool shows, then cached.
+
+    The raw response carries a full record for every parent in the school, so
+    only the handful of fields used here are kept, and only for DIRECTORY_TTL.
+    """
+    if not fresh and os.path.exists(DIRECTORY) and \
+            time.time() - os.path.getmtime(DIRECTORY) < DIRECTORY_TTL:
+        cached = read_json(DIRECTORY)
+        if cached:
+            return cached
+    raw = api(f"parent/v1/{sid()}/listV2/classlist")
+    tiers = {f["id"]: safe(f["name"]) for f in raw.get("filters", [])}
+    parents = []
+    for p in raw.get("parents", []):
+        kids = p.get("ps", [])
+        parents.append({
+            "id": p["id"],
+            "name": name_of(p, "fN", "lN"),
+            "classes": sorted({c for k in kids
+                               for c in (tiers.get(k.get("fTI")), tiers.get(k.get("sTI")))
+                               if c}),
+            "children": ", ".join(name_of(k, "fN", "lN") for k in kids),
+            "me": p.get("me", False)})
+    data = {"filters": [{"id": i, "name": n} for i, n in tiers.items()],
+            "parents": parents}
+    write_private(DIRECTORY, json.dumps(data))
     return data
 
 
@@ -215,8 +284,14 @@ def cmd_login(args):
     print(f"Signed in as {s['name']} <{s['email']}> at {s['school_name']}")
 
 
+def cmd_logout(args):
+    gone = [os.path.basename(p) for p in (SESSION, DIRECTORY)
+            if os.path.exists(p) and (os.remove(p) or True)]
+    print("Removed " + ", ".join(gone) if gone else "Already signed out.")
+
+
 def cmd_whoami(args):
-    s = session(force=args.refresh)
+    s = {k: v for k, v in session(force=args.refresh).items() if k != "token"}
     out(args, s, lambda d: print(f"{d['name']} <{d['email']}>\n"
                                  f"School: {d['school_name']} ({d['school_id']})\n"
                                  f"User id: {d['user_id']}\n"
@@ -225,24 +300,15 @@ def cmd_whoami(args):
 
 def cmd_classes(args):
     data = directory(args.fresh)
-    def render(d):
-        for f in d.get("filters", []):
+    def render(fs):
+        for f in fs:
             print(f"{f['id']:>12}  {f['name']}")
-        print(f"\n{len(d.get('parents', []))} parents in the directory")
-    out(args, data, render)
+        print(f"\n{len(data.get('parents', []))} parents in the directory")
+    out(args, data.get("filters", []), render)
 
 
 def cmd_contacts(args):
-    data = directory(args.fresh)
-    tiers = {f["id"]: f["name"] for f in data.get("filters", [])}
-    rows = []
-    for p in data.get("parents", []):
-        classes = sorted({tiers.get(k["fTI"], k.get("fTI") or "")
-                          for k in p.get("ps", []) if k.get("fTI")})
-        kids = ", ".join(f"{k.get('fN','')} {k.get('lN','')}".strip()
-                         for k in p.get("ps", []))
-        rows.append({"id": p["id"], "name": f"{p.get('fN','')} {p.get('lN','')}".strip(),
-                     "classes": classes, "children": kids, "me": p.get("me", False)})
+    rows = directory(args.fresh).get("parents", [])
     if args.klass:
         want = args.klass.lower()
         rows = [r for r in rows if any(want == c.lower() for c in r["classes"])]
@@ -250,7 +316,7 @@ def cmd_contacts(args):
         q = args.search.lower()
         rows = [r for r in rows
                 if q in r["name"].lower() or q in r["children"].lower()]
-    rows.sort(key=lambda r: r["name"].lower())
+    rows = sorted(rows, key=lambda r: r["name"].lower())
     def render(rs):
         for r in rs:
             tag = " (you)" if r["me"] else ""
@@ -261,16 +327,16 @@ def cmd_contacts(args):
 
 
 def cmd_groups(args):
-    data = api(f"group/v1/parent/{sid()}/list/v3")
+    data = groups_list()
     def render(d):
         for g in d.get("groups", []):
             unread = g.get("notificationCount") or 0
             mark = f"  ({unread} new)" if unread else ""
-            print(f"{g['id']:>20}  {g['title']}  [{g.get('type','')}]{mark}")
+            print(f"{g['id']:>20}  {safe(g['title'])}  [{safe(g.get('type'))}]{mark}")
         if d.get("discover"):
             print("\nNot joined:")
             for g in d["discover"]:
-                print(f"{g['id']:>20}  {g['title']}")
+                print(f"{g['id']:>20}  {safe(g['title'])}")
     out(args, data, render)
 
 
@@ -279,12 +345,11 @@ def cmd_posts(args):
         path = f"group/v1/get/{sid()}/{args.group}/posts/none"
     else:
         path = f"post/v1/activity/{sid()}/list/none"
-    payload = api(path).get("payload", {})
-    posts = payload.get("posts", [])[:args.limit]
+    posts = api(path).get("payload", {}).get("posts", [])[:args.limit]
     def render(ps):
         for p in ps:
-            who = p.get("postedBy") or p.get("postedByFirstName") or ""
-            print(f"[{ts(p.get('postedOn'))}] {who} in {p.get('groupName','?')}")
+            who = safe(p.get("postedBy") or p.get("postedByFirstName"))
+            print(f"[{ts(p.get('postedOn'))}] {who} in {safe(p.get('groupName')) or '?'}")
             print(f"  {clean(p.get('body'), 300)}")
             meta = []
             if p.get("commentCount"):
@@ -295,66 +360,68 @@ def cmd_posts(args):
                 meta.append(f"{p['attachmentCount']} attachments")
             if meta:
                 print("  " + ", ".join(meta))
-            print(f"  https://app.classlist.com/parent/#/post/{p['id']}\n")
+            print(f"  {link('post', p['id'])}\n")
     out(args, posts, render)
 
 
 def cmd_post(args):
-    text = args.text
-    if text == "-":
-        text = sys.stdin.read()
+    text = sys.stdin.read() if args.text == "-" else args.text
     text = text.strip()
     if not text:
         sys.exit("Nothing to post.")
-    groups = {g["id"]: g["title"] for g in api(f"group/v1/parent/{sid()}/list/v3").get("groups", [])}
+    groups = {g["id"]: safe(g["title"]) for g in groups_list().get("groups", [])}
     if args.group not in groups:
         sys.exit(f"You are not in group {args.group}. Run 'classlist groups' to see the ids.")
-    body = text.replace("\n", "<br>")
-    payload = {"currentUserId": session()["user_id"], "body": body,
+    payload = {"currentUserId": session()["user_id"],
+               "body": html.escape(text).replace("\n", "<br>"),
                "postCategory": "GENERAL", "groupId": args.group,
                "attachments": [], "files": [], "linkPreview": ""}
     if not args.yes:
-        print(f"Posting to {groups[args.group]} as "
-              f"{session()['name']}:\n\n{text}\n")
+        print(f"Posting to {groups[args.group]} as {session()['name']}:\n\n{text}\n")
         if input("Send it? [y/N] ").strip().lower() not in ("y", "yes"):
             sys.exit("Not sent.")
     d = api("post/v1/create/v4", body={"payload": payload})
     post = (d.get("payload") or {}).get("post") or {}
     if post.get("id"):
-        print(f"Posted to {groups[args.group]}: "
-              f"https://app.classlist.com/parent/#/post/{post['id']}")
+        print(f"Posted to {groups[args.group]}: {link('post', post['id'])}")
     else:
         print(json.dumps(d, indent=2)[:500])
 
 
 def cmd_events(args):
     data = api(f"event/v1/list/{sid()}/new")
-    key = "pastEvents" if args.past else "futureEvents"
-    events = data.get(key, [])
+    events = data.get("pastEvents" if args.past else "futureEvents", [])
     def render(es):
         for e in es:
-            rsvp = e.get("answer") or ("booked" if e.get("currentUserBooked") else "no reply")
-            print(f"[{ts(e.get('startDate'))}] {e.get('title','')}  ({rsvp})")
-            print(f"  https://app.classlist.com/parent/#/event/{e['eventId']}")
+            rsvp = safe(e.get("answer")) or ("booked" if e.get("currentUserBooked")
+                                             else "no reply")
+            print(f"[{ts(e.get('startDate'))}] {safe(e.get('title'))}  ({rsvp})")
+            print(f"  {link('event', e['eventId'])}")
         print(f"\n{len(es)} {'past' if args.past else 'upcoming'} events")
     out(args, events, render)
 
 
 def cmd_messages(args):
     data = api(f"parent/v1/conversationV2/list/{sid()}")
-    me = session()["user_id"]
-    names = {q["id"]: f"{q.get('fN','')} {q.get('lN','')}".strip()
-             for q in directory().get("parents", [])}
-    names[me] = "you"
+    resolved = {}
+
+    def who_is(x):
+        """Participants arrive either as a record or as a bare user id."""
+        if not isinstance(x, str):
+            return name_of(x)
+        if not resolved:
+            resolved.update({q["id"]: q["name"]
+                             for q in directory().get("parents", [])})
+            resolved[session()["user_id"]] = "you"
+        return resolved.get(x, safe(x))
+
     def render(d):
         for c in d.get("items", []):
             unread = c.get("unreadMessageCount") or 0
             mark = f"  ({unread} unread)" if unread else ""
-            people = c.get("participants") or []
-            who = ", ".join(names.get(x, x) if isinstance(x, str)
-                            else f"{x.get('firstName','')} {x.get('lastName','')}".strip()
-                            for x in people)
-            print(f"[{ts(c.get('timestamp'))}] {c.get('subject') or '(no subject)'}{mark}")
+            who = ", ".join(who_is(x) for x in c.get("participants") or [])
+            print(f"[{ts(c.get('timestamp'))}] "
+                  f"{safe(c.get('subject')) or '(no subject)'}{mark}")
             print(f"  with {who}  id={c['id']}")
             print(f"  {clean(c.get('lastMessage'), 120)}\n")
     out(args, data, render)
@@ -363,15 +430,14 @@ def cmd_messages(args):
 def cmd_thread(args):
     data = api(f"parent/v1/conversationV2/{args.id}/messages/list")
     def render(d):
-        print(f"{d.get('subject') or '(no subject)'}\n")
+        print(f"{safe(d.get('subject')) or '(no subject)'}\n")
         for m in d.get("messages", []):
-            who = f"{m.get('senderFirstName','')} {m.get('senderLastName','')}".strip()
             body = clean(m.get("body"), 400)
             if not body and m.get("linkPreview"):
-                body = f"[shared: {m['linkPreview'].get('title','')}]"
+                body = f"[shared: {safe(m['linkPreview'].get('title'))}]"
             if not body and m.get("file"):
                 body = "[attachment]"
-            print(f"[{ts(m.get('timestamp'))}] {who}")
+            print(f"[{ts(m.get('timestamp'))}] {name_of(m, 'senderFirstName', 'senderLastName')}")
             print(f"  {body}\n")
     out(args, data, render)
 
@@ -391,8 +457,8 @@ def cmd_announcements(args):
     data = api(f"announcement/v1/parent/{sid()}/list")
     def render(d):
         for a in d.get("items", [])[:args.limit]:
-            who = f"{a.get('sentByFirstName','')} {a.get('sentByLastName','')}".strip()
-            print(f"[{ts(a.get('sentOn'))}] {a.get('subject','')}  - {who}  id={a['id']}")
+            who = name_of(a, "sentByFirstName", "sentByLastName")
+            print(f"[{ts(a.get('sentOn'))}] {safe(a.get('subject'))}  - {who}  id={a['id']}")
     out(args, data, render)
 
 
@@ -400,9 +466,9 @@ def cmd_pupils(args):
     data = api(f"parent/v1/{sid()}/list/pupils")
     def render(d):
         for k in d.get("pupils", []):
-            tiers = " / ".join(t for t in (k.get("firstTierName"),
-                                           k.get("secondTierName")) if t)
-            print(f"{k.get('firstName','')} {k.get('lastName','')}  {tiers}")
+            tiers = " / ".join(safe(t) for t in (k.get("firstTierName"),
+                                                 k.get("secondTierName")) if t)
+            print(f"{name_of(k)}  {tiers}")
     out(args, data, render)
 
 
@@ -414,67 +480,73 @@ def cmd_raw(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="classlist",
+    # --json is accepted on either side of the command name, so both
+    # "classlist --json posts" and "classlist posts --json" work.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="raw JSON output")
+    p = argparse.ArgumentParser(prog="classlist", parents=[common],
                                 description="Classlist parent account from the terminal")
-    p.add_argument("--json", action="store_true", help="raw JSON output")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("login", help="sign in and remember the session").set_defaults(fn=cmd_login)
+    sub.add_parser("login", help="sign in and remember the session", parents=[common]).set_defaults(fn=cmd_login)
+    sub.add_parser("logout", help="delete the session and the cached directory", parents=[common]).set_defaults(fn=cmd_logout)
 
-    s = sub.add_parser("whoami", help="show the cached session")
+    s = sub.add_parser("whoami", help="show the cached session", parents=[common])
     s.add_argument("--refresh", action="store_true", help="sign in again first")
     s.set_defaults(fn=cmd_whoami)
 
-    s = sub.add_parser("classes", help="list class/year filters")
+    s = sub.add_parser("classes", help="list class/year filters", parents=[common])
     s.add_argument("--fresh", action="store_true", help="bypass the directory cache")
     s.set_defaults(fn=cmd_classes)
 
-    s = sub.add_parser("contacts", help="the parent directory")
+    s = sub.add_parser("contacts", help="the parent directory", parents=[common])
     s.add_argument("search", nargs="?", help="match a parent or child name")
     s.add_argument("--class", dest="klass", help="limit to one class, e.g. 2B")
     s.add_argument("--fresh", action="store_true", help="bypass the directory cache")
     s.set_defaults(fn=cmd_contacts)
 
-    sub.add_parser("groups", help="groups you are in").set_defaults(fn=cmd_groups)
+    sub.add_parser("groups", help="groups you are in", parents=[common]).set_defaults(fn=cmd_groups)
 
-    s = sub.add_parser("posts", help="the activity stream")
+    s = sub.add_parser("posts", help="the activity stream", parents=[common])
     s.add_argument("-n", "--limit", type=int, default=15)
     s.add_argument("--group", help="only this group id")
     s.set_defaults(fn=cmd_posts)
 
-    s = sub.add_parser("post", help="write a post to one of your groups")
+    s = sub.add_parser("post", help="write a post to one of your groups", parents=[common])
     s.add_argument("text", help="the message, or - to read it from stdin")
     s.add_argument("--group", required=True, help="group id, from 'classlist groups'")
     s.add_argument("--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_post)
 
-    s = sub.add_parser("events", help="school events")
+    s = sub.add_parser("events", help="school events", parents=[common])
     s.add_argument("--past", action="store_true")
     s.set_defaults(fn=cmd_events)
 
-    sub.add_parser("messages", help="your conversations").set_defaults(fn=cmd_messages)
+    sub.add_parser("messages", help="your conversations", parents=[common]).set_defaults(fn=cmd_messages)
 
-    s = sub.add_parser("thread", help="one conversation")
+    s = sub.add_parser("thread", help="one conversation", parents=[common])
     s.add_argument("id")
     s.set_defaults(fn=cmd_thread)
 
-    s = sub.add_parser("notifications", help="recent notifications")
+    s = sub.add_parser("notifications", help="recent notifications", parents=[common])
     s.add_argument("-n", "--limit", type=int, default=20)
     s.set_defaults(fn=cmd_notifications)
 
-    s = sub.add_parser("announcements", help="school announcements")
+    s = sub.add_parser("announcements", help="school announcements", parents=[common])
     s.add_argument("-n", "--limit", type=int, default=20)
     s.set_defaults(fn=cmd_announcements)
 
-    sub.add_parser("pupils", help="your children on file").set_defaults(fn=cmd_pupils)
+    sub.add_parser("pupils", help="your children on file", parents=[common]).set_defaults(fn=cmd_pupils)
 
-    s = sub.add_parser("raw", help="call any API path")
+    s = sub.add_parser("raw", help="call any API path", parents=[common])
     s.add_argument("path")
     s.add_argument("--body", help="JSON request body")
     s.add_argument("--method")
     s.set_defaults(fn=cmd_raw)
 
     args = p.parse_args()
+    args.json = getattr(args, "json", False)
     try:
         args.fn(args)
     except ApiError as e:

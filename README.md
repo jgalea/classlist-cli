@@ -53,7 +53,7 @@ It asks for your Classlist email and password. The password is typed blind, so n
 
 Classlist may email you a verification code the first time. Type the code in when asked.
 
-After that you stay signed in. If the session ever expires, the tool asks again by itself.
+After that you stay signed in. If the session ever expires, the tool asks again by itself. To sign out and delete what is stored, run `classlist logout`.
 
 ## Using it
 
@@ -114,7 +114,7 @@ classlist classes
 
 Recent notifications, school announcements, and the list of classes with their ids.
 
-Add `-n 5` to show fewer items, or `--json` to any command to get the raw data for a spreadsheet or another program.
+`classlist posts`, `classlist notifications` and `classlist announcements` take `-n 5` to show fewer items. Any command takes `--json`, on either side of the command name, to print the raw data for a spreadsheet or another program.
 
 ## Where your information is kept
 
@@ -122,13 +122,13 @@ Everything lives in a folder called `.config/classlist` inside your home folder,
 
 Your password is not stored. What is stored is the session token Classlist hands back when you sign in, which is what keeps you logged in.
 
-The parent directory is saved there too, for fifteen minutes at a time, so that searching it is instant instead of downloading everyone again. That file contains other parents' names and their children's names, exactly as the app shows them to you. If you would rather it were not on disk, delete it when you are done:
+A copy of the parent directory is saved there too, so that searching it is instant instead of downloading everyone again. It is refetched once it is more than fifteen minutes old, but the file itself stays on disk until then, and after that until the next command replaces it. It holds names, classes and children's names, the same things the app shows you, and nothing else from the response.
+
+To remove it along with your session:
 
 ```
-rm -rf ~/.config/classlist
+classlist logout
 ```
-
-That signs you out as well.
 
 ## When something does not work
 
