@@ -245,6 +245,30 @@ def ts(value):
         return safe(value)[:32]
 
 
+def num(value):
+    """Counts come back as strings, and "0" is truthy in Python."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def epoch(value):
+    """Either timestamp shape as a unix epoch, or None when it is unusable."""
+    if not value:
+        return None
+    if isinstance(value, str) and not value.replace(".", "").isdigit():
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v / 1000 if v > 1e11 else v
+
+
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
@@ -370,7 +394,7 @@ def cmd_groups(args):
     data = groups_list()
     def render(d):
         for g in d.get("groups", []):
-            unread = g.get("notificationCount") or 0
+            unread = num(g.get("notificationCount"))
             mark = f"  ({unread} new)" if unread else ""
             print(f"{g['id']:>20}  {safe(g['title'])}  [{safe(g.get('type'))}]{mark}")
         if d.get("discover"):
@@ -392,12 +416,11 @@ def cmd_posts(args):
             print(f"[{ts(p.get('postedOn'))}] {who} in {safe(p.get('groupName')) or '?'}")
             print(f"  {clean(p.get('body'), 300)}")
             meta = []
-            if p.get("commentCount"):
-                meta.append(f"{p['commentCount']} comments")
-            if p.get("likeCount"):
-                meta.append(f"{p['likeCount']} likes")
-            if p.get("attachmentCount"):
-                meta.append(f"{p['attachmentCount']} attachments")
+            for count, label in ((p.get("commentCount"), "comments"),
+                                 (p.get("likeCount"), "likes"),
+                                 (p.get("attachmentCount"), "attachments")):
+                if num(count):
+                    meta.append(f"{num(count)} {label}")
             if meta:
                 print("  " + ", ".join(meta))
             print(f"  {link('post', p['id'])}\n")
@@ -510,6 +533,129 @@ def cmd_reply(args):
     print(f"Replied in thread {args.id}")
 
 
+def stream(cutoff, group=None, cap=300):
+    """Walk the activity stream back to cutoff. A page holds only a few posts."""
+    cursor, posts = "none", []
+    while len(posts) < cap:
+        path = (f"group/v1/get/{sid()}/{group}/posts/{cursor}" if group
+                else f"post/v1/activity/{sid()}/list/{cursor}")
+        payload = api(path).get("payload", {})
+        batch = payload.get("posts") or []
+        if not batch:
+            break
+        posts.extend(batch)
+        oldest = epoch(batch[-1].get("postedOn"))
+        cursor = payload.get("cursor")
+        if not cursor or (oldest is not None and oldest < cutoff):
+            break
+    return [p for p in posts if (epoch(p.get("postedOn")) or 0) >= cutoff]
+
+
+# Classlist tells you about your own posts and about posts you merely follow.
+YOURS = ("_OWNER", "REACTION", "THANK", "LIKE")
+FOLLOWED = ("NEW_COMMENT",)
+ANSWERED = ("GOING", "MAYBE", "NOT_GOING")
+
+
+def cmd_digest(args):
+    now = time.time()
+    cutoff = now - args.days * 86400
+    ahead = now + args.ahead * 86400
+
+    posts = stream(cutoff, args.group)
+    by_group = {}
+    for post in posts:
+        by_group.setdefault(safe(post.get("groupName")) or "?", []).append(post)
+
+    recent = [n for n in api(f"parent/v1/{sid()}/notification/list/-1").get("items", [])
+              if (epoch(n.get("timestamp")) or 0) >= cutoff and n.get("title")]
+    notes = [n for n in recent if any(k in (n.get("event") or "") for k in YOURS)]
+    followed = [n for n in recent
+                if n not in notes
+                and any(k in (n.get("event") or "") for k in FOLLOWED)]
+
+    events = []
+    for e in api(f"event/v1/list/{sid()}/new").get("futureEvents", []):
+        start = epoch(e.get("startDate"))
+        if start is not None and start <= ahead:
+            events.append(e)
+
+    threads = [c for c in api(f"parent/v1/conversationV2/list/{sid()}").get("items", [])
+               if num(c.get("unreadMessageCount"))
+               or (epoch(c.get("timestamp")) or 0) >= cutoff]
+
+    notices = [a for a in api(f"announcement/v1/parent/{sid()}/list").get("items", [])
+               if (epoch(a.get("sentOn")) or 0) >= cutoff]
+
+    digest = {"since": ts(cutoff), "posts": posts, "on_your_posts": notes,
+              "on_posts_you_follow": followed, "events": events,
+              "messages": threads, "announcements": notices}
+
+    def render(_):
+        window = "the last day" if args.days == 1 else f"the last {args.days:g} days"
+        print(f"Classlist digest for {window}, since {ts(cutoff)}\n")
+
+        if notices:
+            print(f"School announcements ({len(notices)})")
+            for a in notices:
+                print(f"  {safe(a.get('subject'))}  "
+                      f"- {name_of(a, 'sentByFirstName', 'sentByLastName')}")
+            print()
+
+        if notes:
+            print(f"On your posts ({len(notes)})")
+            for n in notes:
+                print(f"  {clean(n.get('title'), 90)}")
+            print()
+
+        if followed:
+            print(f"On posts you follow ({len(followed)})")
+            for n in followed:
+                print(f"  {clean(n.get('title'), 90)}")
+            print()
+
+        if threads:
+            unread = sum(num(c.get("unreadMessageCount")) for c in threads)
+            print(f"Messages ({len(threads)} threads, {unread} unread)")
+            for c in threads:
+                flag = f" [{num(c.get('unreadMessageCount'))} unread]" \
+                    if num(c.get("unreadMessageCount")) else ""
+                print(f"  {safe(c.get('subject')) or '(no subject)'}{flag}")
+                print(f"    {clean(c.get('lastMessage'), 90)}  (reply: "
+                      f"classlist reply {c['id']} \"...\")")
+            print()
+
+        if events:
+            print(f"Events in the next {args.ahead:g} days ({len(events)})")
+            for e in events:
+                answer = safe(e.get("answer"))
+                replied = answer in ANSWERED
+                print(f"  {ts(e.get('startDate'))}  {safe(e.get('title'))}  "
+                      f"[{answer.lower() if replied else 'no reply yet'}]")
+                if not replied:
+                    print(f"    classlist rsvp {e['eventId']} going")
+            print()
+
+        if posts:
+            plural = "group" if len(by_group) == 1 else "groups"
+            print(f"Posts ({len(posts)} across {len(by_group)} {plural})")
+            for group, items in sorted(by_group.items(),
+                                       key=lambda kv: -len(kv[1])):
+                print(f"  {group} ({len(items)})")
+                for post in items:
+                    who = safe(post.get("postedBy") or post.get("postedByFirstName"))
+                    print(f"    {ts(post.get('postedOn'))}  {who}")
+                    print(f"      {clean(post.get('body'), 110)}")
+                    if num(post.get("commentCount")):
+                        print(f"      {num(post.get('commentCount'))} comments  "
+                              f"{link('post', post['id'])}")
+            print()
+
+        if not any((posts, notes, followed, events, threads, notices)):
+            print("Nothing new.")
+    out(args, digest, render)
+
+
 def cmd_events(args):
     data = api(f"event/v1/list/{sid()}/new")
     events = data.get("pastEvents" if args.past else "futureEvents", [])
@@ -539,7 +685,7 @@ def cmd_messages(args):
 
     def render(d):
         for c in d.get("items", []):
-            unread = c.get("unreadMessageCount") or 0
+            unread = num(c.get("unreadMessageCount"))
             mark = f"  ({unread} unread)" if unread else ""
             who = ", ".join(who_is(x) for x in c.get("participants") or [])
             print(f"[{ts(c.get('timestamp'))}] "
@@ -640,6 +786,14 @@ def main():
     s.add_argument("--group", required=True, help="group id, from 'classlist groups'")
     s.add_argument("--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_post)
+
+    s = sub.add_parser("digest", help="what happened, in one summary",
+                       parents=[common])
+    s.add_argument("--days", type=float, default=1, help="how far back (default 1)")
+    s.add_argument("--ahead", type=float, default=7,
+                   help="how far ahead to look for events (default 7)")
+    s.add_argument("--group", help="only this group id")
+    s.set_defaults(fn=cmd_digest)
 
     s = sub.add_parser("comment", help="comment on a post", parents=[common])
     s.add_argument("id", help="post id, from 'classlist posts'")

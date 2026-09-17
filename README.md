@@ -131,6 +131,14 @@ Sends a private message, or replies in a conversation you already have. For a ne
 Each of these prints the message and who is getting it, then waits for you to type `y`. Add `--yes` to skip that, which is what you would do in a script.
 
 ```
+classlist digest
+classlist digest --days 7
+classlist digest --group 5551234567890123
+```
+
+One summary of everything that happened: school announcements, comments on your own posts, comments on posts you follow, new messages, events coming up with a reminder of the ones you have not answered, and the posts themselves grouped by group. Defaults to the last day and the next week of events. This is the one to run if you only run one.
+
+```
 classlist notifications
 classlist announcements
 classlist classes
